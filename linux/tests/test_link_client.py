@@ -21,7 +21,8 @@ import struct
 import pytest
 
 from musegadget.link_client import (
-    DeviceDescription, LinkSession, MessageDecoder, Outcome, encode_message, noise_url,
+    DeviceDescription, LinkSession, MessageDecoder, Outcome, describe_result, encode_message,
+    noise_url,
 )
 from musegadget.noise import (
     ApplicationResponse, BodyChunk, NoiseFrameDecoder, NoiseXXResponder, ServiceFrame,
@@ -229,3 +230,41 @@ def test_send_chat_posts_a_device_attributed_message_on_the_same_session():
         task.cancel()
 
     asyncio.run(scenario())
+
+
+def test_each_invoke_logs_how_it_ended_but_not_what_it_ran(caplog):
+    async def scenario():
+        results = iter([
+            {"ok": True, "payload": {"stdout": "", "exit_code": 3, "timed_out": False}},
+            {"ok": False, "error": "unsupported command: lamp.set"},
+        ])
+        session, vm = make_session(lambda *a: next(results), [])
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        await vm.next_message()  # link.register
+        for invoke_id, command in (("inv-1", "system.run"), ("inv-2", "lamp.set")):
+            await vm.send_message({"method": "link.invoke", "id": invoke_id, "command": command,
+                                   "params": {"command": "cat /home/pi/secret"}})
+            await vm.next_message()
+        task.cancel()
+
+    with caplog.at_level("INFO", logger="musegadget.link_client"):
+        asyncio.run(scenario())
+    lines = [r.getMessage() for r in caplog.records]
+    assert any(line.startswith("system.run ok, exit 3 in ") and line.endswith(" ms") for line in lines)
+    assert any(line.startswith("lamp.set failed: unsupported command: lamp.set in ") for line in lines)
+    assert not any("secret" in line for line in lines)
+
+
+@pytest.mark.parametrize("result, described", [
+    ({"ok": True, "payload": {"pump": "on"}}, "ok"),
+    ({"ok": True}, "ok"),
+    ({"ok": True, "payload": {"exit_code": 0, "timed_out": False}}, "ok, exit 0"),
+    ({"ok": True, "payload": {"exit_code": -9, "timed_out": True}}, "ok, exit -9, timed out"),
+    ({"ok": False, "error": "path must be absolute"}, "failed: path must be absolute"),
+    ({"ok": False, "error": "x" * 500}, "failed: " + "x" * 200),
+    ({"ok": False}, "failed: None"),
+])
+def test_describe_result(result, described):
+    assert describe_result(result) == described

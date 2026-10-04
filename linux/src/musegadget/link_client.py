@@ -347,10 +347,24 @@ class LinkSession:
             return
         log.info("invoke %s", command)
         async with self._invokes:
+            started = time.monotonic()
             result = await asyncio.get_running_loop().run_in_executor(
                 None, self._run_command, command, params, timeout_ms,
             )
+            log.info("%s %s in %d ms", command, describe_result(result),
+                     (time.monotonic() - started) * 1000)
         await self.send({"method": "link.result", "id": invoke_id, **result})
+
+
+def describe_result(result: dict) -> str:
+    """How an invoke ended, for the log. Never its parameters or output."""
+    if not result.get("ok"):
+        return f"failed: {str(result.get('error'))[:200]}"
+    payload = result.get("payload")
+    if isinstance(payload, dict) and isinstance(payload.get("exit_code"), int):
+        timed_out = ", timed out" if payload.get("timed_out") else ""
+        return f"ok, exit {payload['exit_code']}{timed_out}"
+    return "ok"
 
 
 class _Request:
