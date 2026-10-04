@@ -229,3 +229,63 @@ def test_send_chat_posts_a_device_attributed_message_on_the_same_session():
         task.cancel()
 
     asyncio.run(scenario())
+
+
+def test_drop_in_command_is_registered_and_runs_over_the_session(tmp_path):
+    import sys
+
+    from musegadget import commands
+    from musegadget.executor import Account, Executor
+
+    program = tmp_path / "pump.py"
+    program.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'pump': 'on' if json.load(sys.stdin)['on'] else 'off'}))\n")
+    (tmp_path / "pump.set.json").write_text(json.dumps({
+        "description": "Switch the garden pump.",
+        "exec": [sys.executable, str(program)],
+        "required": {"on": {"type": "boolean", "description": "true for on."}},
+    }))
+    current = Account.current()
+    executor = Executor(Account(current.name, current.uid, current.gid, str(tmp_path)),
+                        commands.load(tmp_path))
+
+    async def scenario():
+        to_device, to_vm = asyncio.Queue(), asyncio.Queue()
+        device_ws, vm_ws = Pipe(to_device, to_vm), Pipe(to_vm, to_device)
+
+        async def connect(url, headers):
+            return device_ws
+
+        session = LinkSession(
+            noise_host="gw.example", vm_id="vm", vm_auth_token="tok",
+            device=DeviceDescription(node_id="homelink-abcdef", display_name="pi",
+                                     version="0.1.0", commands=executor.specs()),
+            run_command=executor.run, connect=connect,
+        )
+        vm = FakeVm(vm_ws)
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+
+        register = await vm.next_message()
+        spec = register["params"]["commands_v2"]["pump.set"]
+        assert spec["description"] == "Switch the garden pump."
+        assert "exec" not in spec
+        assert "system.run" in register["params"]["commands_v2"]
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        await vm.send_message({"method": "link.invoke", "id": "inv-1", "command": "pump.set",
+                               "params": {"on": True}, "timeout_ms": spec["timeout_ms"]})
+        assert await asyncio.wait_for(vm.next_message(), 10) == {
+            "method": "link.result", "id": "inv-1", "ok": True, "payload": {"pump": "on"}}
+
+        await vm.send_message({"method": "link.invoke", "id": "inv-2", "command": "pump.set",
+                               "params": {}})
+        assert await asyncio.wait_for(vm.next_message(), 10) == {
+            "method": "link.result", "id": "inv-2", "ok": False, "error": "on is required"}
+
+        await vm.send_message({"type": "evt", "event": "link.unpaired"})
+        assert await asyncio.wait_for(task, 2) is Outcome.UNPAIRED
+
+    asyncio.run(scenario())

@@ -115,13 +115,46 @@ A few other ways to build on it:
 
 - **Let Muse do it.** Muse can run commands on the machine, so you can ask it to
   set up the rest: "Write a service that tells me when the Pi gets too hot."
-- **Add a command.** Commands live in [`src/musegadget/executor.py`](src/musegadget/executor.py):
-  add a spec to `COMMAND_SPECS` and a branch in `Executor.run`.
-  [`AGENTS.md`](AGENTS.md) walks through it.
+- **Add a command.** Give Muse a command of its own, like "switch the pump",
+  without changing the package: see [Add your own commands](#add-your-own-commands).
 - **Change the account.** `bash install.sh --run-as someone` gives Muse a
   different account, such as one without sudo.
 - **Change the SDK token.** `bash install.sh --sdk-token mgst_…` replaces it.
   It's saved in `/var/lib/musegadget/sdk_token`, readable only by root.
+
+## Add your own commands
+
+Drop a JSON file in `/etc/musegadget/commands.d/`, named after the command,
+and restart the service. `pump.set.json`:
+
+```json
+{
+  "description": "Switch the garden pump on or off.",
+  "exec": ["/usr/local/bin/pump"],
+  "required": {"on": {"type": "boolean", "description": "true to switch it on."}},
+  "timeout_ms": 10000
+}
+```
+
+```sh
+sudo systemctl restart musegadget
+sudo journalctl -u musegadget | grep commands   # commands from /etc/musegadget/commands.d: pump.set
+```
+
+Muse sees `pump.set` next to the built-in commands and calls it when you ask
+for it. The program runs like `system.run`: as the same account, with no
+shell, and killed after `timeout_ms` (default 30 seconds). It gets the
+parameters as a JSON object on stdin, `{"on": true}`. Print a JSON object to
+return it to Muse; any other output comes back as text. Exit non-zero to
+report an error, with the last line on stderr as the reason.
+
+- **Names** are lowercase words joined by dots, like `pump.set`. Names
+  starting with `system.`, `file.`, `device.` or `link.` are reserved.
+- **Parameters** go under `required` and `optional`, each with a `type`
+  (`string`, `integer`, `number`, `boolean`, `object` or `array`) and a
+  `description`. Muse reads the descriptions, so say what each one does.
+- **Files** must be owned by root and writable only by root, and so must the
+  directory. A file with a problem is skipped with a warning in the log.
 
 ## Manage it
 

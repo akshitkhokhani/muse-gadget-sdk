@@ -14,7 +14,8 @@
 
 """The commands a Muse can invoke on this device.
 
-Shell commands and file operations run in child processes as a separate,
+Shell commands, file operations and the owner's drop-in commands
+(``musegadget.commands``) run in child processes as a separate,
 unprivileged account (``run_as``), never as the service account, which owns
 the device credentials. A command gets exactly the access that account has.
 """
@@ -32,8 +33,10 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from typing import Iterable
 
 from musegadget import __version__
+from musegadget.commands import DropInCommand, InvalidCommand
 
 log = logging.getLogger(__name__)
 
@@ -125,8 +128,13 @@ def error(message: str) -> dict:
 
 
 class Executor:
-    def __init__(self, account: Account) -> None:
+    def __init__(self, account: Account, drop_ins: Iterable[DropInCommand] = ()) -> None:
         self.account = account
+        self.drop_ins = {c.name: c for c in drop_ins if c.name not in COMMAND_SPECS}
+
+    def specs(self) -> dict:
+        """``commands_v2`` for ``link.register``: the built-ins, then the drop-ins."""
+        return {**COMMAND_SPECS, **{name: c.spec for name, c in self.drop_ins.items()}}
 
     def run(self, command: str, params: dict, timeout_ms: int | None = None) -> dict:
         try:
@@ -136,6 +144,8 @@ class Executor:
                 return self.file_op(command.split(".")[1], params)
             if command == "device.health":
                 return ok(device_health())
+            if command in self.drop_ins:
+                return self.run_drop_in(self.drop_ins[command], params)
         except Exception as exc:
             log.exception("%s failed", command)
             return error(f"{type(exc).__name__}: {exc}")
@@ -167,16 +177,65 @@ class Executor:
         log.info("system.run as %s (timeout %ss)", self.account.name, timeout_s)
         started = time.monotonic()
         try:
-            proc = subprocess.Popen(
-                ["/bin/bash", "-c", command], cwd=cwd,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                **self._child_options(),
-            )
+            stdout, stderr, exit_code, timed_out = self._run_child(
+                ["/bin/bash", "-c", command], cwd, timeout_s)
         except OSError as exc:
             return error(f"could not start command: {exc}")
+        out, out_cut = _clip(stdout)
+        err, err_cut = _clip(stderr)
+        return ok({
+            "stdout": out,
+            "stderr": err,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "truncated": out_cut or err_cut,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        })
+
+    def run_drop_in(self, command: DropInCommand, params: dict) -> dict:
+        try:
+            request = json.dumps(command.check_params(params)).encode()
+        except InvalidCommand as exc:
+            return error(str(exc))
+        timeout_s = command.timeout_ms / 1000
+        log.info("%s as %s (timeout %ss)", command.name, self.account.name, timeout_s)
+        try:
+            stdout, stderr, exit_code, timed_out = self._run_child(
+                list(command.argv), self.account.home, timeout_s, stdin=request)
+        except OSError as exc:
+            return error(f"could not start {command.argv[0]}: {exc}")
+        if timed_out:
+            return error(f"{command.name} timed out after {timeout_s:g}s")
+        if exit_code != 0:
+            lines = stderr.decode(errors="replace").strip().splitlines()
+            reason = f": {lines[-1][:500]}" if lines else ""
+            return error(f"{command.name} exited with {exit_code}{reason}")
+        out, cut = _clip(stdout)
+        if not cut:
+            try:
+                payload = json.loads(out)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                return ok(payload)
+        return ok({"output": out, "truncated": True} if cut else {"output": out})
+
+    def _run_child(self, argv: list, cwd: str, timeout_s: float,
+                   stdin: bytes | None = None) -> tuple[bytes, bytes, int, bool]:
+        """Run ``argv`` as the account. Returns stdout, stderr, exit code, timed out.
+
+        On timeout the whole process group is killed. Raises OSError if it
+        can't start.
+        """
+        proc = subprocess.Popen(
+            argv, cwd=cwd,
+            stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            **self._child_options(),
+        )
         timed_out = False
         try:
-            stdout, stderr = proc.communicate(timeout=timeout_s)
+            stdout, stderr = proc.communicate(stdin, timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
             try:
@@ -193,16 +252,7 @@ class Executor:
                     if pipe is not None:
                         pipe.close()
                 proc.wait()
-        out, out_cut = _clip(stdout)
-        err, err_cut = _clip(stderr)
-        return ok({
-            "stdout": out,
-            "stderr": err,
-            "exit_code": proc.returncode,
-            "timed_out": timed_out,
-            "truncated": out_cut or err_cut,
-            "duration_ms": int((time.monotonic() - started) * 1000),
-        })
+        return stdout, stderr, proc.returncode, timed_out
 
     def file_op(self, op: str, params: dict) -> dict:
         request = json.dumps({**params, "op": op})
