@@ -435,14 +435,16 @@ handled in `noise_control.cpp` itself; everything else goes through
 2. **Handle it** in `on_ws_command()` in `main/app.c`. Return
    `{"ok": true, "payload": {...}}`, or `command_error(code, message)` for a
    failure. Only `ok`, `payload` (or a `payload_json` string) and the
-   error's `message` reach the Muse.
+   error's `message` reach the Muse. Always return a result: `NULL` reaches
+   the Muse as a generic "command handler did not return a result" error.
 3. **Don't block.** `on_ws_command()` runs on the Noise session's task, so
    anything slow (the network, a slow sensor, a camera) belongs in its own
    task. Copy `request_id` and `session_generation`, start the task, and
    return `{"_async": true}`. The task then calls
    `noise_ctrl_send_command_result()` once, failures included, or the Muse
-   waits out the timeout. `camera.capture` and `device.discover` work this
-   way. A result from an earlier session is dropped.
+   waits out the timeout. It takes ownership of the result and frees it, so
+   don't free or reuse it afterwards. `camera.capture` and `device.discover`
+   work this way. A result from an earlier session is dropped.
 4. **Gate it on a Kconfig option** in `main/Kconfig.projbuild` when it needs
    particular hardware, and wrap both places in the same `#if`, as
    `sensors.read` does with `CONFIG_HOMEHUB_SENSECAP_SENSORS`. Add new source
