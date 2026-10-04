@@ -437,10 +437,18 @@ handled in `noise_control.cpp` itself; everything else goes through
    failure. Only `ok`, `payload` (or a `payload_json` string) and the
    error's `message` reach the Muse. Always return a result: `NULL` reaches
    the Muse as a generic "command handler did not return a result" error.
+   Validate the parameters yourself: `params` is `NULL` when the request has
+   none, and the firmware doesn't check them against the advertised
+   `required` and `optional`, so check each one's presence, type, length and
+   allowed values.
 3. **Don't block.** `on_ws_command()` runs on the Noise session's task, so
    anything slow (the network, a slow sensor, a camera) belongs in its own
-   task. Copy `request_id` and `session_generation`, start the task, and
-   return `{"_async": true}`. The task then calls
+   task. Copy `request_id`, `session_generation` and every parameter the task
+   needs, strings included, into memory the task owns (`device.discover`
+   uses `cJSON_Duplicate()`): the request is freed as soon as
+   `on_ws_command()` returns. If an allocation or the task start fails, free
+   what you allocated and return `command_error()`. Otherwise start the task
+   and return `{"_async": true}`. The task then calls
    `noise_ctrl_send_command_result()` once, failures included, or the Muse
    waits out the timeout. It takes ownership of the result and frees it, so
    don't free or reuse it afterwards. `camera.capture` and `device.discover`
