@@ -208,6 +208,10 @@ board's pixel avatar, checks the result, then builds and flashes it. Your avatar
 stays out of git. See [`tools/muse/AVATAR_RECIPE.md`](tools/muse/AVATAR_RECIPE.md)
 for how it works and for boards that need the manual steps.
 
+To give Muse a command of its own, such as reading a sensor or switching a
+relay, advertise it in `link.register` and handle it in `main/app.c`.
+[`AGENTS.md`](AGENTS.md#adding-a-command) walks through it.
+
 To work on the UI without a board, use the
 [`simulator/`](simulator/README.md) desktop preview. It runs the production UI
 and avatar renderer in a 412 x 412 SenseCAP Watcher window, supports mouse and

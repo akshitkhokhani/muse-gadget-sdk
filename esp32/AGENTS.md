@@ -417,6 +417,48 @@ The device still needs to be paired once for its token.
   larger Secure Boot bootloader. Check the `check_sizes` line in the build
   output: app slots are 2 MB (4 MB on Muse).
 
+## Adding a command
+
+Muse calls a gadget's commands by name: the firmware lists them in
+`link.register` and answers each `link.invoke`. A command you add lives in two
+places, which must use the same name. (`device.health` and `device.ota` are
+handled in `noise_control.cpp` itself; everything else goes through
+`on_ws_command()`.)
+
+1. **Advertise it** in `build_register_json()` in `main/noise_control.cpp`:
+   `add_command(commands, "relay.set", "<description>", required, optional)`.
+   `required` and `optional` map each parameter's name to `{type,
+   description}` (`string_param()` makes a string one). Muse reads the
+   descriptions, so say what the command does and what it returns. If it can
+   take longer than the default 30 seconds, set its `timeout_ms`, as
+   `device.discover` does.
+2. **Handle it** in `on_ws_command()` in `main/app.c`. Return
+   `{"ok": true, "payload": {...}}`, or `command_error(code, message)` for a
+   failure. Only `ok`, `payload` (or a `payload_json` string) and the
+   error's `message` reach the Muse.
+3. **Don't block.** `on_ws_command()` runs on the Noise session's task, so
+   anything slow (the network, a slow sensor, a camera) belongs in its own
+   task. Copy `request_id` and `session_generation`, start the task, and
+   return `{"_async": true}`. The task then calls
+   `noise_ctrl_send_command_result()` once, failures included, or the Muse
+   waits out the timeout. `camera.capture` and `device.discover` work this
+   way. A result from an earlier session is dropped.
+4. **Gate it on a Kconfig option** in `main/Kconfig.projbuild` when it needs
+   particular hardware, and wrap both places in the same `#if`, as
+   `sensors.read` does with `CONFIG_HOMEHUB_SENSECAP_SENSORS`. Add new source
+   files to `main/CMakeLists.txt`.
+5. **Keep `link.register` small.** It's printed into at most 8 KB, and a
+   device whose registration doesn't fit never registers.
+6. **Add a host test** in `tests/`. `test_link_sensecap_sensors.py` checks
+   that `sensors.read` is advertised and dispatched under the same option, and
+   runs its parser against a harness.
+
+Muse sees the command once the board reconnects with the new firmware. Keep
+the management commands that `on_ws_command()` also handles (`device.list_vms`,
+`device.set_vm`, `device.reset_vm` and `device.unpair`) out of
+`link.register`: `tests/test_link_transport_contract.py` checks they stay
+unadvertised.
+
 ## Say Muse, never Hatch
 
 Users never see the name Hatch.
