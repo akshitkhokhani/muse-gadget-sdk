@@ -22,7 +22,7 @@ import pytest
 
 from musegadget.link_client import (
     DeviceDescription, LinkSession, MessageDecoder, Outcome, describe_result, encode_message,
-    noise_url,
+    noise_url, printable,
 )
 from musegadget.noise import (
     ApplicationResponse, BodyChunk, NoiseFrameDecoder, NoiseXXResponder, ServiceFrame,
@@ -236,14 +236,14 @@ def test_each_invoke_logs_how_it_ended_but_not_what_it_ran(caplog):
     async def scenario():
         results = iter([
             {"ok": True, "payload": {"stdout": "", "exit_code": 3, "timed_out": False}},
-            {"ok": False, "error": "unsupported command: lamp.set"},
+            {"ok": False, "error": "no such file: /home/pi/secret"},
         ])
         session, vm = make_session(lambda *a: next(results), [])
         task = asyncio.ensure_future(session.run(asyncio.Event()))
         await vm.handshake()
         await vm.accept_control_stream()
         await vm.next_message()  # link.register
-        for invoke_id, command in (("inv-1", "system.run"), ("inv-2", "lamp.set")):
+        for invoke_id, command in (("inv-1", "system.run"), ("inv-2", "file.read\nforged")):
             await vm.send_message({"method": "link.invoke", "id": invoke_id, "command": command,
                                    "params": {"command": "cat /home/pi/secret"}})
             await vm.next_message()
@@ -253,7 +253,8 @@ def test_each_invoke_logs_how_it_ended_but_not_what_it_ran(caplog):
         asyncio.run(scenario())
     lines = [r.getMessage() for r in caplog.records]
     assert any(line.startswith("system.run ok, exit 3 in ") and line.endswith(" ms") for line in lines)
-    assert any(line.startswith("lamp.set failed: unsupported command: lamp.set in ") for line in lines)
+    assert any(line.startswith("file.read?forged failed in ") for line in lines)
+    assert not any("\n" in line for line in lines)
     assert not any("secret" in line for line in lines)
 
 
@@ -262,9 +263,13 @@ def test_each_invoke_logs_how_it_ended_but_not_what_it_ran(caplog):
     ({"ok": True}, "ok"),
     ({"ok": True, "payload": {"exit_code": 0, "timed_out": False}}, "ok, exit 0"),
     ({"ok": True, "payload": {"exit_code": -9, "timed_out": True}}, "ok, exit -9, timed out"),
-    ({"ok": False, "error": "path must be absolute"}, "failed: path must be absolute"),
-    ({"ok": False, "error": "x" * 500}, "failed: " + "x" * 200),
-    ({"ok": False}, "failed: None"),
+    ({"ok": False, "error": "no such file: /home/pi/secret"}, "failed"),
+    ({"ok": False}, "failed"),
 ])
 def test_describe_result(result, described):
     assert describe_result(result) == described
+
+
+def test_printable_replaces_control_characters():
+    assert printable("system.run") == "system.run"
+    assert printable("a\nb\x1b[2Jc") == "a?b?[2Jc"
