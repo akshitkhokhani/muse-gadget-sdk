@@ -186,7 +186,7 @@ class NoiseFrameDecoder:
             if assembly is None:
                 if len(self._pending) >= MAX_PENDING_ASSEMBLIES:
                     raise ValueError("too many pending noise frame assemblies")
-                now = time.time()
+                now = time.monotonic()
                 assembly = _Assembly(
                     chunks={},
                     total=frame.total_chunks,
@@ -207,7 +207,7 @@ class NoiseFrameDecoder:
                 self._pending.pop(frame.chunk_id, None)
                 raise ValueError(f"duplicate chunkIndex {frame.chunk_index}")
 
-            assembly.last_updated = time.time()
+            assembly.last_updated = time.monotonic()
             assembly.total_bytes += len(frame.payload)
             if assembly.total_bytes > MAX_ASSEMBLY_BYTES:
                 self._pending.pop(frame.chunk_id, None)
@@ -226,7 +226,7 @@ class NoiseFrameDecoder:
             raise
 
     def _evict_expired(self) -> None:
-        now = time.time()
+        now = time.monotonic()
         expired = [
             chunk_id
             for chunk_id, assembly in self._pending.items()
