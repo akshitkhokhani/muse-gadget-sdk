@@ -60,3 +60,18 @@ def test_a_rejected_refresh_reports_401(monkeypatch):
 
     monkeypatch.setattr(muse_api.urllib.request, "urlopen", urlopen)
     assert muse_api.refresh_device_token("r", "homelink-abcdef") == (None, 401)
+
+
+@pytest.mark.parametrize("operation", ["fetch", "refresh"])
+def test_invalid_utf8_response_is_a_retryable_failure(operation, monkeypatch, caplog):
+    class Response(io.BytesIO):
+        def getcode(self):
+            return 200
+    monkeypatch.setattr(muse_api.urllib.request, "urlopen",
+                        lambda *args, **kwargs: Response(b'{"secret": "\xff"}'))
+    if operation == "fetch":
+        assert muse_api.fetch_vms_with_status("synthetic-access") == ([], None)
+    else:
+        assert muse_api.refresh_device_token("synthetic-refresh", "fixture") == (None, None)
+    assert "synthetic-access" not in caplog.text
+    assert "synthetic-refresh" not in caplog.text
