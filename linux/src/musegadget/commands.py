@@ -150,7 +150,8 @@ def _params(value, key: str) -> dict:
     if not isinstance(value, dict):
         raise InvalidCommand(f"{key} must be an object of parameters")
     for name, spec in value.items():
-        if (not isinstance(spec, dict) or spec.get("type") not in PARAM_TYPES
+        if (not isinstance(spec, dict) or not isinstance(spec.get("type"), str)
+                or spec["type"] not in PARAM_TYPES
                 or not isinstance(spec.get("description"), str)
                 or set(spec) != {"type", "description"}):
             raise InvalidCommand(
@@ -166,26 +167,45 @@ def load(directory: Path) -> list:
     file is skipped.
     """
     try:
-        paths = sorted(directory.glob("*.json"))
-    except OSError as exc:
-        log.warning("can't read commands from %s: %s", directory, exc)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
         return []
-    commands = []
-    for path in paths:
-        try:
-            commands.append(_load_file(path))
-        except InvalidCommand as exc:
-            log.warning("skipping %s: %s", path, exc)
-    if commands:
-        log.info("commands from %s: %s", directory, ", ".join(c.name for c in commands))
-    return commands
+    except OSError as exc:
+        log.warning("can't read commands from %s: %s", directory, type(exc).__name__)
+        return []
+    try:
+        st = os.fstat(fd)
+        if os.geteuid() == 0 and (st.st_uid != 0 or st.st_mode & 0o022):
+            log.warning("skipping commands directory %s: must be owned by root "
+                        "and writable only by root", directory)
+            return []
+        paths = [directory / name for name in sorted(os.listdir(fd)) if name.endswith(".json")]
+        commands = []
+        for path in paths:
+            try:
+                commands.append(_load_file(path, directory_fd=fd))
+            except InvalidCommand as exc:
+                log.warning("skipping %s: %s", path, exc)
+            except Exception as exc:
+                # Isolate only this definition. Exception text may contain its secrets;
+                # BaseException (including cancellation/KeyboardInterrupt) propagates.
+                log.warning("skipping %s: %s while loading definition", path, type(exc).__name__)
+        if commands:
+            log.info("commands from %s: %s", directory, ", ".join(c.name for c in commands))
+        return commands
+    except OSError as exc:
+        log.warning("can't read commands from %s: %s", directory, type(exc).__name__)
+        return []
+    finally:
+        os.close(fd)
 
 
-def _load_file(path: Path) -> DropInCommand:
+def _load_file(path: Path, directory_fd: int | None = None) -> DropInCommand:
     try:
         # No symlinks, and no blocking on a FIFO. The checks below are on the
         # open file, so it can't be swapped between checking and reading.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path if directory_fd is None else path.name,
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
         with os.fdopen(fd, "rb") as f:
             st = os.fstat(f.fileno())
             if not stat.S_ISREG(st.st_mode):
@@ -198,7 +218,7 @@ def _load_file(path: Path) -> DropInCommand:
             raise InvalidCommand(f"larger than {MAX_FILE_BYTES} bytes")
         data = json.loads(raw.decode("utf-8"))
     except OSError as exc:
-        raise InvalidCommand(f"can't read it: {exc}") from exc
+        raise InvalidCommand(f"can't read it: {type(exc).__name__}") from exc
     except (ValueError, RecursionError) as exc:
         raise InvalidCommand(f"not valid JSON: {type(exc).__name__}") from exc
     return parse(path.name[:-len(".json")], data)

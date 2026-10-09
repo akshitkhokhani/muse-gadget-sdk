@@ -146,20 +146,35 @@ for it. The program runs like `system.run`: as the same account, with no
 shell, and killed after `timeout_ms` (default 30 seconds). It gets the
 parameters as a JSON object on stdin, `{"on": true}`. Print a JSON object to
 return it to Muse; any other output comes back as text. Exit non-zero to
-report an error, with the last line on stderr as the reason.
+report an error, with the last captured line on stderr as the reason.
+Both output streams are retained up to 96 KiB (with JSON escaping accounted
+for). Once the program itself exits, inherited pipes are drained for at most
+0.5 seconds; background descendants do not turn success into a timeout.
 
 - **Names** are lowercase words joined by dots, like `pump.set`. Names
   starting with `system.`, `file.`, `device.` or `link.` are reserved.
 - **Parameters** go under `required` and `optional`, each with a `type`
   (`string`, `integer`, `number`, `boolean`, `object` or `array`) and a
   `description`. Muse reads the descriptions, so say what each one does.
-- **Files** must be owned by root and writable only by root, and so must the
-  directory. A file with a problem is skipped with a warning in the log.
+- **Files and directory:** when the service runs as root, both must be owned
+  by root and neither may be group- or world-writable. Directory and file
+  symlinks are refused. Non-root development still permits your own files
+  and directory; `MUSEGADGET_COMMANDS_DIR` selects it. This is a trust check,
+  not a sandbox or a guarantee against changes by another root process.
+- **Bad definitions** are diagnosed and skipped individually; other commands
+  remain usable. Diagnostics omit configuration contents and unexpected
+  exception text.
+- **Registration:** built-ins are kept. Complete custom specs are considered
+  in command-name order, skipping any that would put the serialized
+  `link.register` (metadata, escaping and four-byte prefix included) above
+  256 KiB. Later smaller definitions may still fit. Skipped commands are
+  neither advertised nor executable. Check the log for `skipping command`;
+  a VM registration rejection is still reported as a rejection.
 
 ## Manage it
 
 ```sh
-musegadget info                          # name, node id and pairing state
+sudo musegadget info                     # name, node id and pairing state
 sudo systemctl status musegadget         # is it running?
 sudo journalctl -u musegadget -f         # follow the log
 sudo musegadget pair                     # pair again

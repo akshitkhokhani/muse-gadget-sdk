@@ -56,6 +56,10 @@ HANDSHAKE_TIMEOUT_S = 20
 PING_INTERVAL_S = 20
 MAX_CONCURRENT_INVOKES = 4
 MAX_INBOUND_MESSAGE = 4 * 1024 * 1024
+# Documented VM limit: 256 KiB per device control message. Include the u32
+# length prefix in our budget, conservatively, not just the JSON payload.
+MAX_CONTROL_MESSAGE_BYTES = 256 * 1024
+REGISTER_ID_BYTES = 36  # str(uuid.uuid4())
 # Matches JavaScript's encodeURIComponent, as the firmware does.
 _URI_COMPONENT_SAFE = "-_.!~*'()"
 
@@ -87,6 +91,10 @@ class DeviceDescription:
             "commands_v2": self.commands,
         }
 
+    def register_message(self, request_id: str) -> dict:
+        return {"type": "req", "id": request_id, "method": "link.register",
+                "params": self.register_params()}
+
 
 def encode_message(obj: dict) -> bytes:
     data = json.dumps(obj, separators=(",", ":")).encode()
@@ -117,7 +125,7 @@ class MessageDecoder:
                 continue  # keepalive
             try:
                 message = json.loads(raw)
-            except json.JSONDecodeError:
+            except ValueError:  # bad JSON, or bytes that aren't UTF-8
                 log.warning("dropping malformed control message (%d bytes)", length)
                 continue
             if isinstance(message, dict):
@@ -226,12 +234,10 @@ class LinkSession:
         self._stream_id = encrypted.stream_id
         await self._send_frames(encrypted.frames)
         self._register_id = str(uuid.uuid4())
-        await self.send({
-            "type": "req",
-            "id": self._register_id,
-            "method": "link.register",
-            "params": self._device.register_params(),
-        })
+        message = self._device.register_message(self._register_id)
+        if len(encode_message(message)) > MAX_CONTROL_MESSAGE_BYTES:
+            raise ValueError("link.register exceeds the VM's control message budget")
+        await self.send(message)
         log.info("sent link.register as %s", self._device.node_id)
 
     # -- Device-originated requests -------------------------------------------
@@ -345,12 +351,33 @@ class LinkSession:
         timeout_ms = message.get("timeout_ms") or None
         if not invoke_id:
             return
-        log.info("invoke %s", command)
+        shown = printable(command)
+        log.info("invoke %s", shown)
         async with self._invokes:
+            started = time.monotonic()
             result = await asyncio.get_running_loop().run_in_executor(
                 None, self._run_command, command, params, timeout_ms,
             )
+            log.info("%s %s in %d ms", shown, describe_result(result),
+                     (time.monotonic() - started) * 1000)
         await self.send({"method": "link.result", "id": invoke_id, **result})
+
+
+def printable(text: str) -> str:
+    """text with control characters replaced, so it can't forge log lines."""
+    return "".join(ch if ch.isprintable() else "?" for ch in text)
+
+
+def describe_result(result: dict) -> str:
+    """How an invoke ended, for the log. Never its parameters, output or error,
+    which can echo them."""
+    if not result.get("ok"):
+        return "failed"
+    payload = result.get("payload")
+    if isinstance(payload, dict) and isinstance(payload.get("exit_code"), int):
+        timed_out = ", timed out" if payload.get("timed_out") else ""
+        return f"ok, exit {payload['exit_code']}{timed_out}"
+    return "ok"
 
 
 class _Request:
