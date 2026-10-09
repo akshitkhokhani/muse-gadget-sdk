@@ -21,7 +21,8 @@ import struct
 import pytest
 
 from musegadget.link_client import (
-    DeviceDescription, LinkSession, MessageDecoder, Outcome, encode_message, noise_url,
+    DeviceDescription, LinkSession, MessageDecoder, Outcome, describe_result, encode_message,
+    noise_url, printable,
 )
 from musegadget.noise import (
     ApplicationResponse, BodyChunk, NoiseFrameDecoder, NoiseXXResponder, ServiceFrame,
@@ -199,6 +200,12 @@ def test_decoder_rejects_oversize_messages():
         MessageDecoder().feed(struct.pack("<I", 1 << 30))
 
 
+def test_decoder_drops_messages_that_are_not_utf8():
+    garbage = b'{"a":"\xff"}'
+    data = struct.pack("<I", len(garbage)) + garbage + encode_message({"b": 2})
+    assert MessageDecoder().feed(data) == [{"b": 2}]
+
+
 def test_vm_id_is_escaped_like_encode_uri_component():
     assert noise_url("h", "a-b_c.d!~*'()?&=") == "wss://h/v1/noise?vm_id=a-b_c.d!~*'()%3F%26%3D"
 
@@ -229,3 +236,150 @@ def test_send_chat_posts_a_device_attributed_message_on_the_same_session():
         task.cancel()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fill_budget", [False, True])
+def test_drop_in_command_is_registered_and_runs_over_the_session(tmp_path, fill_budget):
+    import sys
+
+    from musegadget import commands
+    from musegadget.executor import Account, Executor
+
+    program = tmp_path / "pump.py"
+    program.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'pump': 'on' if json.load(sys.stdin)['on'] else 'off'}))\n")
+    (tmp_path / "pump.set.json").write_text(json.dumps({
+        "description": "Switch the garden pump.",
+        "exec": [sys.executable, str(program)],
+        "required": {"on": {"type": "boolean", "description": "true for on."}},
+    }))
+    if fill_budget:
+        for i in range(4):
+            (tmp_path / f"custom.a{i}.json").write_text(json.dumps({
+                "description": "x" * 60000, "exec": ["/bin/true"]}))
+        (tmp_path / "zzz.large.json").write_text(json.dumps({
+            "description": "界" * 21000, "exec": ["/bin/true"]}, ensure_ascii=False))
+    (tmp_path / "aaa.bad.json").write_text(json.dumps({
+        "description": "bad", "exec": ["/bin/true"],
+        "required": {"x": {"type": ["string"], "description": "d"}}}))
+    current = Account.current()
+    executor = Executor(Account(current.name, current.uid, current.gid, str(tmp_path)),
+                        commands.load(tmp_path))
+
+    async def scenario():
+        to_device, to_vm = asyncio.Queue(), asyncio.Queue()
+        device_ws, vm_ws = Pipe(to_device, to_vm), Pipe(to_vm, to_device)
+
+        async def connect(url, headers):
+            return device_ws
+
+        session = LinkSession(
+            noise_host="gw.example", vm_id="vm", vm_auth_token="tok",
+            device=DeviceDescription(node_id="homelink-abcdef", display_name="pi",
+                                     version="0.1.0", commands=executor.specs(
+                                         node_id="homelink-abcdef", display_name="pi", version="0.1.0")),
+            run_command=executor.run, connect=connect,
+        )
+        vm = FakeVm(vm_ws)
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+
+        register = await vm.next_message()
+        spec = register["params"]["commands_v2"]["pump.set"]
+        assert spec["description"] == "Switch the garden pump."
+        assert "exec" not in spec
+        assert "system.run" in register["params"]["commands_v2"]
+        from musegadget.link_client import MAX_CONTROL_MESSAGE_BYTES
+        assert len(encode_message(register)) <= MAX_CONTROL_MESSAGE_BYTES
+        assert "aaa.bad" not in register["params"]["commands_v2"]
+        if fill_budget:
+            assert "zzz.large" not in register["params"]["commands_v2"]
+            assert len(register["params"]["commands_v2"]) == 9
+        await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+
+        await vm.send_message({"method": "link.invoke", "id": "inv-1", "command": "pump.set",
+                               "params": {"on": True}, "timeout_ms": spec["timeout_ms"]})
+        assert await asyncio.wait_for(vm.next_message(), 10) == {
+            "method": "link.result", "id": "inv-1", "ok": True, "payload": {"pump": "on"}}
+
+        await vm.send_message({"method": "link.invoke", "id": "inv-2", "command": "pump.set",
+                               "params": {}})
+        assert await asyncio.wait_for(vm.next_message(), 10) == {
+            "method": "link.result", "id": "inv-2", "ok": False, "error": "on is required"}
+
+        if fill_budget:
+            await vm.send_message({"method": "link.invoke", "id": "inv-skipped",
+                                   "command": "zzz.large", "params": {}})
+            assert await asyncio.wait_for(vm.next_message(), 2) == {
+                "method": "link.result", "id": "inv-skipped", "ok": False,
+                "error": "unsupported command: zzz.large"}
+
+        await vm.send_message({"type": "evt", "event": "link.unpaired"})
+        assert await asyncio.wait_for(task, 2) is Outcome.UNPAIRED
+
+    asyncio.run(scenario())
+
+
+def test_each_invoke_logs_how_it_ended_but_not_what_it_ran(caplog):
+    async def scenario():
+        results = iter([
+            {"ok": True, "payload": {"stdout": "", "exit_code": 3, "timed_out": False}},
+            {"ok": False, "error": "no such file: /home/pi/secret"},
+        ])
+        session, vm = make_session(lambda *a: next(results), [])
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        await vm.handshake()
+        await vm.accept_control_stream()
+        await vm.next_message()  # link.register
+        for invoke_id, command in (("inv-1", "system.run"), ("inv-2", "file.read\nforged")):
+            await vm.send_message({"method": "link.invoke", "id": invoke_id, "command": command,
+                                   "params": {"command": "cat /home/pi/secret"}})
+            await vm.next_message()
+        task.cancel()
+
+    with caplog.at_level("INFO", logger="musegadget.link_client"):
+        asyncio.run(scenario())
+    lines = [r.getMessage() for r in caplog.records]
+    assert any(line.startswith("system.run ok, exit 3 in ") and line.endswith(" ms") for line in lines)
+    assert any(line.startswith("file.read?forged failed in ") for line in lines)
+    assert not any("\n" in line for line in lines)
+    assert not any("secret" in line for line in lines)
+
+
+@pytest.mark.parametrize("result, described", [
+    ({"ok": True, "payload": {"pump": "on"}}, "ok"),
+    ({"ok": True}, "ok"),
+    ({"ok": True, "payload": {"exit_code": 0, "timed_out": False}}, "ok, exit 0"),
+    ({"ok": True, "payload": {"exit_code": -9, "timed_out": True}}, "ok, exit -9, timed out"),
+    ({"ok": False, "error": "no such file: /home/pi/secret"}, "failed"),
+    ({"ok": False}, "failed"),
+])
+def test_describe_result(result, described):
+    assert describe_result(result) == described
+
+
+def test_printable_replaces_control_characters():
+    assert printable("system.run") == "system.run"
+    assert printable("a\nb\x1b[2Jc") == "a?b?[2Jc"
+
+
+def test_rejected_registration_is_not_marked_as_registered(caplog):
+    async def scenario():
+        session, vm = make_session(lambda *args: {}, [])
+        task = asyncio.ensure_future(session.run(asyncio.Event()))
+        try:
+            await vm.handshake()
+            await vm.accept_control_stream()
+            register = await vm.next_message()
+            await vm.send_message({"type": "res", "id": register["id"],
+                                   "error": {"message": "registration rejected"}})
+            await vm.send_message({"type": "evt", "event": "link.unpaired"})
+            assert await asyncio.wait_for(task, 2) is Outcome.UNPAIRED
+            assert session.registered_at is None
+        finally:
+            task.cancel()
+
+    asyncio.run(scenario())
+    assert "link.register rejected" in caplog.text

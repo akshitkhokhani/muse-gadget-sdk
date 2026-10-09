@@ -194,7 +194,7 @@ static lv_obj_t *back_button(lv_obj_t *p)
 static lv_obj_t *page(lv_obj_t *tile, const char *title, bool back, lv_obj_t **list_out)
 {
     /* Flat short panels, and ones too narrow for LIST_W, get tighter rows. */
-    const bool compact = !muse_board->round && (muse_board->height <= 240 || muse_board->width < 300);
+    const bool compact = !muse_board->round && (muse_board->height <= 240 || muse_board->width < LIST_W);
     const int list_top = compact ? (back ? 48 : 36) : LIST_TOP;
     lv_obj_t *p = lv_obj_create(tile);
     lv_obj_remove_style_all(p);
@@ -1229,8 +1229,10 @@ static void build_power_page(lv_obj_t *tile)
     button(list, LV_SYMBOL_POWER "  Power off", COLOR_DANGER, on_power_off, NULL);
     button(list, "Cancel", COLOR_TEXT, on_back, NULL);
     char text[128];
+    const char *power = muse_board->power_button ? muse_board->power_button : muse_board->talk_button;
+    const char *sleep = muse_board->power_button ? muse_board->power_button : muse_board->aux_button;
     snprintf(text, sizeof(text), "Press the %s button to turn it back on. To just turn the screen off, press the %s button.",
-             muse_board->talk_button, muse_board->aux_button);
+             power, sleep);
     note(list, text);
 }
 
