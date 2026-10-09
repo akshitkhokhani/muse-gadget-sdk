@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -65,3 +67,30 @@ def test_load_json_does_not_mistake_permission_denied_for_missing(tmp_path):
             config.load_json("identity.json", tmp_path)
     finally:
         path.chmod(0o600)
+
+
+def test_concurrent_state_saves_publish_complete_independent_files(tmp_path, monkeypatch):
+    # Pairing and service token rotation both save pairing.json. Hold their
+    # real renames until both writers have finished their temporary files.
+    barrier = threading.Barrier(2, timeout=5)
+    replace = config.os.replace
+    def publish(source, destination):
+        barrier.wait()
+        return replace(source, destination)
+    monkeypatch.setattr(config.os, "replace", publish)
+    records = [{"fixture": "a" * 1000}, {"fixture": "b" * 2000}]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(config.save_json, config.PAIRING_FILE, value, tmp_path)
+                   for value in records]
+        for future in futures:
+            future.result(timeout=10)
+    assert config.load_json(config.PAIRING_FILE, tmp_path) in records
+    assert list(tmp_path.iterdir()) == [tmp_path / config.PAIRING_FILE]
+
+
+def test_failed_state_serialization_keeps_old_file_and_removes_temp(tmp_path):
+    config.save_json(config.PAIRING_FILE, {"fixture": "old"}, tmp_path)
+    with pytest.raises(TypeError):
+        config.save_json(config.PAIRING_FILE, {"invalid": object()}, tmp_path)
+    assert config.load_json(config.PAIRING_FILE, tmp_path) == {"fixture": "old"}
+    assert list(tmp_path.iterdir()) == [tmp_path / config.PAIRING_FILE]

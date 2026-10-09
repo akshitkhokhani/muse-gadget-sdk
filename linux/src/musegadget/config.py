@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 
 STATE_DIR_ENV = "MUSEGADGET_STATE_DIR"
@@ -82,13 +83,19 @@ def save_json(name: str, data: dict, directory: Path | None = None) -> None:
     directory = directory or state_dir()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = directory / name
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
 
 
 def delete_json(name: str, directory: Path | None = None) -> None:
