@@ -4,7 +4,6 @@ Thumbs.db
 
 # Editors / IDEs
 .idea/
-.vscode/
 *.swp
 *.swo
 *~
@@ -24,3 +23,5 @@ muse-simulator.ppm
 # Local gadget provisioning and original-device flash backups.
 .sdk-token
 /backups/
+config.bat
+node_modules
